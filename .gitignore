@@ -128,3 +128,10 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+input.txt
+output.txt
+brain
+brainPlease
+brainSuggestions
+context.txt
