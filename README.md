@@ -19,7 +19,7 @@ This script automates the extraction and comparison of file contents in a direct
 2. **Environment Variables**  
    Create a `.env` file in the project directory with the following variables:
    ```env
-   BASE_PATH=C:/Users/Adria/Desktop/Proyectos/web-inventory-automation
+   BASE_PATH=C:/Path/To
    FORGE_PATH=./
    ```
 
