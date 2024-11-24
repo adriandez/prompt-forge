@@ -1,154 +1,236 @@
-import fs from "fs-extra";
-import path from "path";
-import dotenv from "dotenv";
-import simpleGit from "simple-git";
+//The admin logged into the system at 192.168.0.1 and searched Google.
+
+import fs from 'fs-extra';
+import path from 'path';
+import dotenv from 'dotenv';
+import simpleGit from 'simple-git';
+import { logger } from './logger.js'; // Import the logger
 
 // Load environment variables from .env file
 dotenv.config();
 
 const BASE_PATH =
   process.env.BASE_PATH ||
-  "C:/Users/Adria/Desktop/Proyectos/web-inventory-automation"; // Default base path
-const FORGE_PATH = process.env.FORGE_PATH || "./"; // Default forge path
-const INPUT_FILE = path.join(FORGE_PATH, "input.txt"); // Input file
-const OUTPUT_FILE = path.join(FORGE_PATH, "output.txt"); // Output file
+  'C:/Users/Adria/Desktop/Proyectos/web-inventory-automation';
+const FORGE_PATH = process.env.FORGE_PATH || './';
+const INPUT_FILE = path.join(FORGE_PATH, 'input.txt');
+const OUTPUT_FILE = path.join(FORGE_PATH, 'output.txt');
+const AUTO_CHECK = process.env.AUTO_CHECK === 'true';
 
-const git = simpleGit(BASE_PATH); // Initialize Git in the BASE_PATH
+// Validate environment variables
+const validateEnv = () => {
+  if (!fs.existsSync(BASE_PATH)) {
+    throw new Error(`Invalid BASE_PATH in .env: ${BASE_PATH}`);
+  }
+  if (!fs.existsSync(FORGE_PATH)) {
+    throw new Error(`Invalid FORGE_PATH in .env: ${FORGE_PATH}`);
+  }
+};
+validateEnv();
 
-// Get the previous committed content of a file
-const getPreviousCommittedContent = async (filePath) => {
-  try {
-    const relativePath = path.relative(BASE_PATH, filePath).replace(/\\/g, "/");
-    console.log(`[DEBUG] Fetching committed content for: ${relativePath}`);
+const git = simpleGit(BASE_PATH);
 
-    // Check if the file is inside the repository and tracked
-    const isTracked = await git.raw(["ls-files", relativePath]);
-    if (!isTracked.trim()) {
-      console.warn(
-        `[DEBUG] The file '${relativePath}' is either untracked or outside the repository.`,
-      );
-      return null;
+// Helper function to check if a file is within the BASE_PATH repository
+const isFileInRepo = (filePath) => {
+  const relativePath = path.relative(BASE_PATH, filePath).replace(/\\/g, '/');
+  return !relativePath.startsWith('..') && !path.isAbsolute(relativePath);
+};
+
+// Validate if paths exist
+const validatePaths = async (filePaths) => {
+  const validPaths = [];
+  for (const filePath of filePaths) {
+    try {
+      if (await fs.pathExists(filePath)) {
+        validPaths.push(filePath);
+      } else {
+        logger.warn(`Path not found: ${filePath}`);
+      }
+    } catch (error) {
+      logger.error(`Error validating path: ${filePath} - ${error.message}`);
     }
+  }
+  return validPaths;
+};
 
-    // Fetch the committed content
+// Get the previous committed content of a file if it is within the repository
+const getPreviousCommittedContent = async (filePath) => {
+  if (!isFileInRepo(filePath)) {
+    logger.warn(
+      `Skipping Git operations for file outside repository: ${filePath}`
+    );
+    return null;
+  }
+
+  try {
+    const relativePath = path.relative(BASE_PATH, filePath).replace(/\\/g, '/');
+    const isTracked = await git.raw(['ls-files', relativePath]);
+    if (!isTracked.trim()) return null;
+
     const content = await git.show([`HEAD:${relativePath}`]);
     return content.trim();
   } catch (error) {
-    if (error.message.includes("outside repository")) {
-      console.warn(
-        `[DEBUG] The file '${filePath}' is outside the current Git repository. Skipping...`,
-      );
-    } else if (error.message.includes("exists on disk, but not in 'HEAD'")) {
-      console.warn(
-        `[DEBUG] The file '${filePath}' exists but is not tracked in Git. Skipping committed content fetch.`,
-      );
-    } else {
-      console.warn(
-        `[DEBUG] Unable to fetch committed content for ${filePath}: ${error.message}`,
-      );
-    }
-    return null; // Return null for errors
+    logger.error(
+      `Failed to get previous committed content for ${filePath}: ${error.message}`
+    );
+    return null;
   }
 };
 
-// Recursively get the content of all files in a directory or process a single file
+// Helper function to exclude specific files
+const shouldExclude = (fileName) =>
+  [
+    'package-lock.json',
+    'node_modules',
+    '.vscode',
+    '.gitignore',
+    '.prettierignore',
+    'eslint.config.js',
+    'input.txt',
+    'output.txt'
+  ].includes(fileName);
+
+// Batch processing function
+const processInBatches = async (tasks, batchSize = 10) => {
+  for (let i = 0; i < tasks.length; i += batchSize) {
+    const batch = tasks.slice(i, i + batchSize);
+    await Promise.all(batch.map((task) => task()));
+  }
+};
+
+// Recursively process files with batched promises
 const getFileContent = async (filePath) => {
   try {
     const stats = await fs.stat(filePath);
 
     if (stats.isDirectory()) {
-      console.log(`[DEBUG] Entering directory: ${filePath}`);
       const files = await fs.readdir(filePath, { withFileTypes: true });
 
-      const results = [];
-      for (const file of files) {
-        const nestedFilePath = path.join(filePath, file.name);
-        const nestedContent = await getFileContent(nestedFilePath);
-        results.push(...nestedContent); // Flatten nested results
-      }
+      const contentPromises = files
+        .filter((file) => !shouldExclude(file.name))
+        .map((file) => {
+          const nestedFilePath = path.join(filePath, file.name);
+          return () => getFileContent(nestedFilePath); // Return function for batching
+        });
 
-      return results;
+      const results = [];
+      await processInBatches(contentPromises, 10);
+      for (const promise of contentPromises) {
+        results.push(...(await promise()));
+      }
+      return results.flat();
     } else if (stats.isFile()) {
-      console.log(`[DEBUG] Reading file: ${filePath}`);
-      const currentContent = await fs.readFile(filePath, "utf-8");
+      if (stats.size === 0) {
+        logger.warn(`Skipping empty file: ${filePath}`);
+        return [];
+      }
+      const currentContent = await fs.readFile(filePath, 'utf-8');
       const previousContent = await getPreviousCommittedContent(filePath);
 
       const result = [
         `----> [${path.basename(filePath)}]:\n\n${currentContent
           .trim()
-          .replace(/^/gm, "- ")}\n\n`,
+          .replace(/^/gm, '- ')}\n\n`
       ];
 
       if (previousContent) {
         result.push(
-          `----> [Previous Committed - ${path.basename(
-            filePath,
-          )}]:\n\n${previousContent.trim().replace(/^/gm, "- ")}\n\n`,
+          `----> [Previous Committed - ${path.basename(filePath)}]:\n\n${previousContent
+            .trim()
+            .replace(/^/gm, '- ')}\n\n`
         );
       }
 
+      logger.info(`Processed file: ${filePath}`);
       return result;
     } else {
-      console.log(`[DEBUG] Skipping non-file, non-directory: ${filePath}`);
       return [];
     }
   } catch (error) {
-    console.error(`[DEBUG] Error processing path: ${filePath}`, error.message);
+    logger.error(`Error processing file: ${filePath} - ${error.message}`);
     return [`[ERROR] Unable to process path: ${filePath}`];
   }
 };
 
 // Process files listed in input.txt
+const processInputFiles = async () => {
+  try {
+    if (!fs.existsSync(INPUT_FILE)) {
+      throw new Error(`Input file not found: ${INPUT_FILE}`);
+    }
+
+    const filePaths = fs
+      .readFileSync(INPUT_FILE, 'utf-8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    const validPaths = await validatePaths(filePaths);
+
+    const contentPromises = validPaths.map((filePath) => {
+      const absolutePath = filePath.startsWith('@forge ')
+        ? path.resolve(FORGE_PATH, filePath.replace('@forge ', '').trim())
+        : path.resolve(BASE_PATH, filePath);
+
+      logger.debug(`[DEBUG] Resolving path: ${absolutePath}`);
+      return () => getFileContent(absolutePath); // Return function for batching
+    });
+
+    const results = [];
+    await processInBatches(contentPromises, 10);
+    for (const promise of contentPromises) {
+      results.push(...(await promise()));
+    }
+    return results.flat();
+  } catch (error) {
+    logger.error(`Error processing input files: ${error.message}`);
+    return [];
+  }
+};
+
+// Process root folder files if AUTO_CHECK is true
+const processRootFiles = async () => {
+  try {
+    const files = await fs.readdir(FORGE_PATH, { withFileTypes: true });
+
+    const contentPromises = files
+      .filter((file) => !shouldExclude(file.name) && file.isFile())
+      .map((file) => () => getFileContent(path.join(FORGE_PATH, file.name))); // Return function for batching
+
+    const results = [];
+    await processInBatches(contentPromises, 10);
+    for (const promise of contentPromises) {
+      results.push(...(await promise()));
+    }
+    return results.flat();
+  } catch (error) {
+    logger.error(`Error processing root files: ${error.message}`);
+    return [];
+  }
+};
+
+// Main function to process files
 const processFiles = async () => {
   try {
-    console.log(`[DEBUG] Input file path: ${INPUT_FILE}`);
-    console.log(`[DEBUG] Output file path: ${OUTPUT_FILE}`);
+    logger.start('Starting file processing...');
+    const mode = AUTO_CHECK
+      ? 'Self-Improvement (AUTO_CHECK=true)'
+      : 'External-Improvement (AUTO_CHECK=false)';
+    logger.info(`Running in ${mode} mode`);
+    const results = ['START\n---\n'];
 
-    // Check if the input file exists
-    if (!fs.existsSync(INPUT_FILE)) {
-      console.error(`Input file not found: ${INPUT_FILE}`);
-      return;
-    }
+    const fileContents = AUTO_CHECK
+      ? await processRootFiles()
+      : await processInputFiles();
 
-    // Read the input file to determine directories or files to scan
-    const filePaths = fs
-      .readFileSync(INPUT_FILE, "utf-8")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0); // Filter out empty lines
+    results.push(...fileContents, '---\nEND\n');
 
-    if (filePaths.length === 0) {
-      console.error("No file paths found in the input file.");
-      return;
-    }
-
-    // Prepare output header
-    const results = ["START\n---\n"];
-
-    // Process each directory or file listed in the input file
-    for (const filePath of filePaths) {
-      let absolutePath;
-
-      // Check if the file should be read from FORGE_PATH
-      if (filePath.startsWith("@forge ")) {
-        const trimmedPath = filePath.replace("@forge ", "").trim();
-        absolutePath = path.resolve(FORGE_PATH, trimmedPath);
-        console.log(`[DEBUG] Resolving path from FORGE_PATH: ${absolutePath}`);
-      } else {
-        absolutePath = path.resolve(BASE_PATH, filePath);
-        console.log(`[DEBUG] Resolving path from BASE_PATH: ${absolutePath}`);
-      }
-
-      const content = await getFileContent(absolutePath); // Recursive traversal for directories
-      results.push(...content);
-    }
-
-    // Append footer and write all collected results to the output file
-    results.push("---\nEND\n");
-    await fs.writeFile(OUTPUT_FILE, results.join("\n"), "utf-8");
-    console.log(`Output written to: ${OUTPUT_FILE}`);
+    await fs.writeFile(OUTPUT_FILE, results.join('\n'), 'utf-8');
+    logger.success(`Output written to: ${OUTPUT_FILE}`);
   } catch (error) {
-    console.error("Error processing files:", error.message);
+    logger.error(`Error processing files: ${error.message}`);
+  } finally {
+    logger.end('File processing completed.');
   }
 };
 
